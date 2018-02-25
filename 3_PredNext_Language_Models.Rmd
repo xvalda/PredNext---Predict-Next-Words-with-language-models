@@ -1,0 +1,461 @@
+---
+title: "3_PredNext Language Models"
+author: "xvalda"
+date: "10 February 2018"
+output: html_document
+pdf_document: default
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(tm); library(dplyr); library(ggplot2); library(stringi); library(stringr); library(tokenizers); library(tidytext); library(knitr)
+setwd("C:/Users/Xavier/Documents/DataScienceCourses/Coursera/Capstone")
+
+load("data-EN/dat1.Rda"); load("data-EN/dat2.Rda"); load("data-EN/dat3.Rda"); load("data-EN/dat4.Rda"); load("data-EN/dat5.Rda")
+```
+
+
+## 1. Introduction
+
+This document is an overview of how I implemented several possible algorithms and even though not all code may be present, I tried to make the whole document very clear both for the reader and for myself.   
+It comprises several parts:  
+- processing input text   
+- explaining different algorithms   
+- implementing the code for at least one algorithm   
+- testing accuracy and speed   
+
+## 2. Process input text 
+
+We need to convert the input text into a format that the algorithm can understand.   
+
+### 2.1. Transform input text (text string) in a character vector
+
+```{r, eval = FALSE}
+#We want only characters or apostrophe, so we replace everything that is not text or apostrophe [^a-zA-Z |'] by nothing ("").
+#(note that we want to preserve apostrophe since we created the dataset assuming that we prefer to retain expressions like "it's" instead of transforming them into "its")
+gsub("[^A-Za-z | ']","", input_text)  
+#We remove the blank spaces left by the transformation above:
+stripWhitespace(gsub("[^A-Za-z |']","", input-_text))
+#lowercase the result
+tolower(stripWhitespace(gsub("[^A-Za-z |']","", input_text)))
+#remove blank space at the beginning of the input_text string in case there's one: 
+gsub("^\\s+","", input_text)
+#split the character string into a list, where each word will be isolated
+strsplit(input_text, " ")
+#transform the list into a character vector
+unlist(strsplit(input_text, " "))
+```
+
+
+Example:  
+our input text is "What's the BEST ". The code belows preserves only characters and apostrophes, lowercases, removes extra blank spaces, ...        
+ 
+
+```{r}
+#we condense it all in one command line
+input_text <- "What's the BEST"
+input_text <- tolower(stripWhitespace(gsub("[^A-Za-z |']","", input_text))); input_text <- gsub("^\\s+","", input_text); input_text <- unlist(strsplit(input_text, " "))
+print(input_text)
+```
+
+We could transform all input text into a character vector, "what's", "the", and "best".   
+Now imagining that we have a much longer sentence, what interests us is just the last few words.    
+
+### 2.2. Create input ngrams  
+
+We need to take the last few words of a sentence:   
+- the last 4 words, so that we match them to our list of 5grams to suggest which are the most probable words   
+- the last 3 words, that we'll match to our 4grams   
+- the last 2 words   
+- the last word   
+
+
+```{r}
+#to make the code more readable, I store the input_text in the "a" object
+a <- input_text
+#input 4gram, if the input text is of size 4 or greater, then the 4gram exists and we paste the last 4 words of the sentence, otherwise, our input 4gram is an empty string
+input_4gr <- ifelse(length(a) > 3, paste(a[(length(a)-3):length(a)], collapse = " "), "")
+#replicate process for input 3, 2 and 1grams
+input_3gr <- ifelse(length(a) > 2, paste(a[(length(a)-2):length(a)], collapse = " "), "")
+input_2gr <- ifelse(length(a) > 1, paste(a[(length(a)-1):length(a)], collapse = " "), "")
+input_1gr <- ifelse(length(a) > 0, paste(a[length(a)], collapse = " "), "")
+print(c(input_4gr, input_3gr, input_2gr, input_1gr))
+```
+
+The output above is exactly what we need. The first string is empty, it's the input 4gram, meaning the last 4 words of our input text. But since we typed only 3 words so far in the input box, the 4gram doesn't exist and choose to leave it as an empty string of text.   
+
+Then the input 3gram ("what's the best"), bigram ("the best") and unigram ("best") are the objects we will use to search through our training datasets.   
+
+### 2.3. Prepare search strings
+
+We will need to use our input ngrams to search if they exist in the (n+1)gram datasets.   
+For instance, we'll search the fourgram dataset (object that we called dat4) and look for all 4grams that start with "what's the best".   
+We will probably find 4grams like: "what's the best way", "what's the best advice", "what's the best thing", and so on ...   
+
+In order to peform that search, we need to look for "^what's the best ", so our input 3gram preceded by a caret (we're looking for 4grams that start with that expression so that we find the last word, without the caret we could find things like "and what's the best", which wouldn't help us).   
+We also want a space at the end so that we predict the next word and not the current word.   
+
+```{r}
+#prepare search strings
+a4 <- paste0("^", input_4gr, " ")
+a3 <- paste0("^", input_3gr, " ")
+a2 <- paste0("^", input_2gr, " ")
+a1 <- paste0("^", input_1gr, " ")
+```
+
+Now we have all our pieces to start thinking of the algorithms we can use.   
+
+
+## 3. Algorithms - Predicting the Next Word
+
+There are a number of methods to measure the probability of a next word to appear and associated smoothing mechanisms:   
+- Stupid backoff   
+- Katz backoff    
+- Kneser-Ney smoothing   
+- Witten-Bell smoothing   
+- Jelinek-Mercer smoothing   
+
+This comes with associated concepts such as:   
+- Absolute discounting   
+- Additive smoothing   
+- Good-Turing Estimate   
+- ...    
+
+I summarize below a few essential points, but the best place to start is to go through the chapter 4 of **"Speech and Language Processing"** by Jurafsky & Martin, 28.08.2017 [1] as well as the course videos [2].  
+In addition to academic papers, I'm taking also several examples from high quality documents by Phil Ferriere [4] and Thach-Ngoc TRAN [7] among others, all referenced at the end of the document.   
+
+### 3.1. Chain rule of probabilities and Markov assumption
+Chain rule of probabilities [1]:  
+Let's take the following sentence:   
+"the book I just read was so  ..."   
+Our question is what comes next: "great", "good", "bad", ...?   
+
+Chain rule of probabilities: 
+P(the) * P(book|the) * P(I|the book) * P(just|the book I) * .... * P(great|the book I just read was so)   
+
+The last probability would be calculated like this:  
+ 
+$$P(great|the, book, I, just, read, was, so) = \frac{COUNT("the, book, I, just, read, was, so, great")}{COUNT("the, book, I, just, read, was, so"}$$
+
+There are too many possible sentences and this approach to compute the probability of a sentence occuring wouldn't be practically feasible.    
+
+The Markov model helps us by stating that we can predict the probability of a future event without looking too far into the history.  
+The ** Markov assumption ** allows us to approximate P(great|the book I just read was so) with P(great|so), a much more practical approach.[1]   
+
+Our chain probability from before becomes: 
+P(the) * P(book|the) * P(I|book) * P(just|I) * P(read|just).... * P(great|so)   
+
+### 3.2. Maximum Likelihood Estimation
+
+We measure each of these probabilities with the MLE (maximum likelihood estimation). The probability of the bigram equals the count of all occurences of the bigram in the dataset, divided by all bigrams that start with the (n-1)th term.   
+For instance P(Chinese food) = COUNT("Chinese food") / (COUNT("Chinese food"") + COUNT("Chinese Theater") + ...each bigram starting with "Chinese"...))   
+
+Instead of counting all occurences of bigrams starting with "Chinese", we simply count how many times the unigram "Chinese" occurs in the dataset. It sill be same thing, since each "Chinese" unigram will be followed by a word or the end of sentence marker, which also constitutes a bigram.    
+
+$$P(w_n|w_{n-1}) = \frac{C(w_{n-1} w_n)}{C(w_{n-1})}$$
+
+### 3.3. Dealing with unseen words
+
+Many combinations are not seen in the training dataset, and our probability would be 0, our model would say that a combination of words is not possible. We can prevent his with smoothing methods.   
+The idea is to steal some of the probability mass of the observed probabilities in the dataset and give it to words/ngrams that are unseen before.   
+
+The Laplace add-1 smoothing is not used for ngrams, we use instead other methods like Good-Turing, and Kneser-Ney smoothing.[1]   
+
+### 3.4. Stupid backoff
+
+The stupid backoff system is the simplest solution for web-scale ngrams, it allows to compute very quickly a score (rather than a probability) for ngrams on very large datasets.   
+
+$$S(w_i|w^{i-1}_{i-k+1}) =  \left\{ \begin{array}{ll}
+         \frac{count(w^i_{i-k+1})}{count(w^{i-1}_{i-k+1})} & \mbox{if $count(w^i_{i-k+1})>0$};\\
+        \lambda S(w_i|w^{i-1}_{i-k+2}) & \mbox{otherwise}.\end{array} \right.$$
+
+With a lambda value empirically set to 0.4.   
+
+We could take for instance the beginning of a Beatles song: "with a little help".   
+
+We want to get suggestions for a possible next word.    
+**Starting with 5gram candidates (search for 4gram input in 5gram dataset):   **
+- Our input text is the fourgram "with a little help"   
+- We search for 5gram candidates through our fivegrams dataset, all 5grams that begin with "^with a little help".  
+- We find in this example only one 5gram starting with "with a little help ", we measure the score: count("with a little help from") / count("with a little help"): 64/75 = 0.85   
+**Back off to next lower order ngram (search for 3gram input in 4gram dataset): **   
+- We want to find more suggestions since we only have one so far, we back off one lower order ngram.  
+- Our new input text is now a 3gram: "a little help" (we ignore "with" that was at the beginning).   
+- In the 4grams training set, we find 3 4grams starting with "a little help":   
+"a little help FROM" (count = 99)    
+"a little help WITH" (count = 9)  
+"a little help IN" (count = 5)   
+- In the 3grams training set, we find 188 occurences of "a little help" (it includes also occurences when "a little help" is at the end of a line of text/sentence).   
+- We ignore the "FROM" suggestion since we have it as a candidate already.   
+- We compute the scores for the 2 remaining options:   
+"WITH" - score = 0.4 * 9 / 188 = 0.019   
+"IN" - score = 0.4 * 5 / 188 = 0.011   
+**Back off to next lower order ngram (search for 2gram input in 3gram dataset): **   
+- We follow exactly the same principle.   
+- The score is this time 0.4 x 0.4 x count(3gram candidate) / count(2gram)   
+- For instance, "little help ON" has a count of 5, the bigram "little help" has a count of 221, the score is 0.4 x 0.4 x 5/221 = 0.0036   
+
+We continue the process until we find our 3 (or more) suggestions.   
+In this case, we find:  
+- from (score = 0.85)  
+- with (score = 0.019)  
+- in (score = 0.011)  
+- on (score = 0.0036)   
+
+To summarize, stupid backoff computes a score using MLE, starting with the highest order ngram. If we find enough suggestions, we stop here, if not, we back off one ngram order and apply a penalty of lambda (0.4 is the most commonly chosen value), and we continue the backoff process (multiplying by 0.4 for each lower order ngram we back off to), until we find enough suggestions/predictions.   
+
+
+### 3.5. Good-Turing discounting
+
+Good-Turing discounting is used in both Katz Backoff and Kneser-Ney smoothing, so very important to conceptualize.   
+
+Good-Turing helps estimate the count of ngrams we haven't seen in the training dataset.   
+
+**Frequency of frequencies: ** noted Nc, it's the amount N of ngrams that do have the same count c (or frequency) in the datasets. N6 for instance is the sum of all ngrams that appear 6 times in the dataset.   
+
+**Computing the Good-Turing discounting: ** Best is to reuse the example from Jurafsky & Martin [1]. We have a simple dataset comprising different fish:   
+- 10 carps   
+- 3 perch   
+- 2 whitefish   
+- 1 trout   
+- 1 salmon   
+- 1 eel   
+-----------   
+Total fish = 18   
+
+- What is the next fish we can see in this pond? For instance, P(trout) would be 1/18.   
+- The probability of seeing a catfish, that we haven't seen before, would be 0/18, but it cannot be. The idea is to steal some of the probability mass of each observed occurences and redistribute it to something we've never seen before.   
+- We do this by using the probability of things we've seen once, and that's where we use the frequency of frequencies: N1.   
+- In this example, there three fish we've seen only once, so N1 = 3, and we divide it by the total: P(catfish) = N1/N = 3/18.   
+- Since we need all probabilities to sum up to one, we need to recalculate the probabilities of all species observed in the dataset.   
+- Discounted count for species we've seen before:    
+$$C^* = \frac{(C+1) N_{n+1}}{N_c}$$
+- For trout, c is the count of trout = 1, N2 is the the number of items appearing twice = 1 (just whitefish appeared twice in the dataset), N1 = 3.   
+- Discounted count for species we've seen before:    
+
+$$C^*(trout) = \frac{(1+1) N_{2}}{N_1} = 2 * \frac{1}{3}$$
+And since we have the new discounted count, we can calculate the probability:   
+$$P_{GT}(trout) = \frac{C^*(trout)}{N} =  \frac{\frac{2}{3}}{18} = \frac{1}{27}$$
+The probability of trout appearing next went from MLE = 1/18 to Pgt(trout) = 1/27. Each item needs to be discounted the same way.   
+
+To summarize the formulas:  
+And since we have the new discounted count, we can calculate the probability:   
+$$P_{GT} =  \left\{ \begin{array}{ll}
+         \frac{N_1}{N} & \mbox{for unseen ngrams};\\
+        \frac{(C+1) N_{c+1}}{N*N_c} & \mbox{for ngrams that are seen in the dataset}.\end{array} \right.$$
+
+Where: N = total count of all items in the dataset   
+N1 = how many items appear 1 time   
+C = count or freqnecy of a specific item   
+Nc = how many items appear c times   
+
+### 3.6. Katz backoff
+Tha Katz backoff model could look somewhat similar to the stupid backoff system: if the exact expression is not found in the fivegram dataset, it will search to a lower order ngram dataset.   
+Imagining that we wouldn't find any match for "with a little help" in the fivegram dataset, we would look for "a little help" in the fourgram dataset, and apply a "penalty", that is more complex and complete for Katz Backoff than the lambda penalty in stupid backoff.   
+The model estimates the conditional probability of an ngram given its history.   
+
+The equation found from Wikipedia looks like this:   
+<img src="https://wikimedia.org/api/rest_v1/media/math/render/svg/aae25720b9baf1323ffd204e7cce431ce91665f2" height="400px" width="600px" />
+
+where:  
+- d is the discounting found with Good-Turing (see previous section)   
+- C(x) is the count of ngrams   
+- k is generally set to 0 (meaning that we check if the ngram exists in the dataset, if not we back off to the second expression)   
+- alpha is the backoff weight, calculated this way:  
+<img src="https://wikimedia.org/api/rest_v1/media/math/render/svg/e84585028a0b5479f141107be029aa6af60e152b" height="100px" width="600px" />
+If no match is found for the (n-1)gram, we skip it and go to the (n-2)gram.   
+- Beta is the left-over probability mass for the (n-1)gram, calculated this way:   
+<img src="https://wikimedia.org/api/rest_v1/media/math/render/svg/6855946639af18504dcaef28c8e89c5aeb0fb168" height="100px" width="600px" />
+
+I'm refering to the excellent article by Thach-Ngoc TRAN [7] for a practical explanation of how to compute this, as well as the code to implement it in R [8].   
+
+<img src="https://thachtranerc.files.wordpress.com/2016/04/pfinalpro.png?w=1024" height="600px" width="800px" />   
+Source: https://thachtranerc.wordpress.com/2016/04/12/katzs-backoff-model-implementation-in-r/   
+
+Katz backoff is superior to stupid backoff, yielding more accuracy in the next word prediction.   
+
+### 3.7. Kneser-Ney Smoothing
+
+Even more accurate is the Kneser-Ney smoothing, as it takes into account additional factors such as absolute discounting (d), interpolation and continuation:   
+1. high order ngram with absolute discounting, if substracting d makes it negative, we take 0 instead.  
+2. lambda weight that takes all probability mass from all the normalized discounts we took from the higher order probabilities.  
+3. probability of word continuation (how likely is the the word to appear as a novel continuation, meaning that we count the number of ngram types it completes)   
+
+<img src="\Users\Xavier\Documents\kneserney.png" height="200px" width="500px" />   
+
+There is much more to this and there are some must-read material:  
+- "Speech and Language Processing", Jurafsky & Martin, page 51 to 53 [1]   
+- Phil Ferriere article provides a concise and very concrete approach [4].  
+- http://smithamilli.com/blog/kneser-ney/  
+- http://www.foldl.me/2014/kneser-ney-smoothing/  
+
+
+## 4. Implementing the Stupid Backoff algorithm 
+
+### 4.1. Pre-computing stupid backoff scores
+
+Instead of computing the score every time a character or word is entered in the app, we can save time by precomputing the scores, resulting in datasets showing ngrams and their corresponding score (instead of their count).   
+
+The process we chose was to:  
+1. use our datasets, the "n" column will be the numerator of our MLE   
+2. add "lo_ng" (i.e. lower order ngram) column to the dataset: this is the denominator for our MLE (for "with a little help from", we'll need to have the count of "with a little help").   
+3. get numerical values of the "lo_ng" column from the (n-1)gram dataset. Although the t/m/s/l...apply() functions seem a natural choice, the processing time is too long. a much quicker choice is the merge() function.  
+4. compute the score, appling the lamda coefficient where necessary    
+5. perform a couple of cleaning tasks: renaming columns, deleting unnecessary ones    
+
+We perform this for 5grams, 4grams, 3grams and 2grams    
+
+```{r, eval = FALSE}
+#funtion to create the lower order ngram
+a <- function(x){
+  paste(unlist(strsplit(x, " "))[1:4], collapse = " ")
+}
+#run function across all rows to get the lower order ngram in column lo_ng
+dat5$lo_ng <- unlist(lapply(dat5$ngrams, a))
+#retrieve the sum of lower order ngrams with merge() function (using grep in conjunction with lapply or similar functions would take too long)
+dat5_sb <- merge(dat5, dat4, by.x = "lo_ng", by.y = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+#remove NAs
+dat5_sb <- na.omit(dat5_sb)
+#rename columns
+names(dat5_sb) <- c("lo_ng", "ngrams", "c_ngrams", "c_lo_ng")
+#calculate score for stupid backoff
+dat5_sb <- dat5_sb %>%
+  mutate(s = c_ngrams/c_lo_ng)
+dat5_sb <- dat5_sb[,c(1,5)]
+
+########4GRAMS
+a <- function(x){
+  paste(unlist(strsplit(x, " "))[1:3], collapse = " ")
+}
+dat4$lo_ng <- unlist(lapply(dat4$ngrams, a))
+dat4_sb <- merge(dat4, dat3, by.x = "lo_ng", by.y = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+dat4_sb <- na.omit(dat4_sb)
+names(dat4_sb) <- c("lo_ng", "ngrams", "c_ngrams", "c_lo_ng")
+dat4_sb <- dat4_sb[,c(2, 3, 1, 4)]
+dat4_sb <- dat4_sb %>%
+  mutate(s = 0.4*c_ngrams/c_lo_ng)
+dat4_sb <- dat4_sb[,c(1,5)]
+
+########3GRAMS
+a <- function(x){
+  paste(unlist(strsplit(x, " "))[1:2], collapse = " ")
+}
+dat3$lo_ng <- unlist(lapply(dat3$ngrams, a))
+dat3_sb <- merge(dat3, dat2, by.x = "lo_ng", by.y = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+dat3_sb <- na.omit(dat3_sb)
+names(dat3_sb) <- c("lo_ng", "ngrams", "c_ngrams", "c_lo_ng")
+dat3_sb <- dat3_sb %>%
+  mutate(s = 0.4*0.4*c_ngrams/c_lo_ng)
+dat3_sb <- dat3_sb[,c(1,5)]
+
+########2GRAMS
+a <- function(x){
+  paste(unlist(strsplit(x, " "))[1], collapse = " ")
+}
+dat2$lo_ng <- unlist(lapply(dat2$ngrams, a))
+dat2_sb <- merge(dat2, dat1, by.x = "lo_ng", by.y = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+dat2_sb <- na.omit(dat2_sb)
+names(dat2_sb) <- c("lo_ng", "ngrams", "c_ngrams", "c_lo_ng")
+dat2_sb <- dat2_sb[,c(2, 3, 1, 4)]
+dat2_sb <- dat2_sb %>%
+  mutate(s = 0.4*0.4*0.4*c_ngrams/c_lo_ng)
+dat2_sb <- dat2_sb[,c(1,5)]
+
+########## END OF CODE OK ##############
+#save(dat1_sb, file = "data-EN/dat1_sb.Rda")
+#save(dat2_sb, file = "data-EN/dat2_sb.Rda")
+#save(dat3_sb, file = "data-EN/dat3_sb.Rda")
+#save(dat4_sb, file = "data-EN/dat4_sb.Rda")
+#save(dat5_sb, file = "data-EN/dat5_sb.Rda")
+
+```
+
+
+### 4.2. Function to predict the next word
+
+Since we have now all our datasets with the precomputed stupid backoff scores, we just need to match input text to the ngrams and return the ones with highest scores.   
+
+We created a predict_sb() function that will perform the following:  
+1. Take the input text, isolate each word and create unigrams to fourgrams.   
+```{r, eval = FALSE}
+#Instead of the code, I'm using an example:
+input_4gr <- "^with a little help "
+input_2gr <- "^a little help "
+input_2gr <- "^little help "
+input_1gr <- "^help "
+#note that all input ngrams start with the caret sign and finish with a space to make them ready to match (n+1)grams in our datasets. 
+```
+
+2. If our text has 4 words or more, we match the input fourgram to our fivegram dataset to retrieve possible words.  
+```{r, eval = FALSE}
+#if input_text has 4 or more words, then we have a corresponding 4gram for the last 4 words
+if(length(input_text)>=4){
+  #we store in a dataframe a subset of all 5grams matching our input text
+  results5 <- dat5_sb[grep(input_4gr, dat5_sb$ngrams),]
+  #we delete the 4 words of the 5gram to keep only the last word, the one we want to predict
+  results5$ngrams <- gsub(input_4gr, "", results5$ngrams)
+  #if we have more than 5 suggestions ...
+  if(nrow(results5)>5){
+  #... we sort the results by the highest scores ...
+  results5 <- results5[order(-results5$s),]
+  #... we print a subset of the top 5 results .... 
+  print(results5[1:5,]) 
+  #... and we stop the function (we need to insert some code at the beginning of the function to avoid returning an error: opt <-       options(show.error.messages = FALSE); on.exit(options(opt)))
+  stop() 
+  }
+#the rest of the condition for our input_text, if the user just started typing and we don't have a fourgram input text yet, we create an empty results dataframe, since we'll "rbind" different results datasets when backing off to lower order ngrams, the object must exist. 
+}else{
+  results5 <- data.frame(ngrams="", s = 0)
+}
+```
+
+3. We create a similar chunk of code if the input text has 3 words or more.  
+```{r, eval = FALSE}
+#the code is the same, but we need to add 2 lines: 
+#in our example, "with a little help", the suggestion "from" was already found before backing off to this stage, we need to discard it from these new results: 
+results4 <- results4[!is.element(results4$ngrams, results5$ngrams),]
+#we create a new results dataframe, where we merge the results from results5 and results4:    
+results <- rbind(results5, results4)
+```
+
+4. We continue still two levels down   
+
+5. At the last level, if we don't find any results OR the sentence hasn't started yet, we simply suggest the highest frequency unigrams: "the", "to", "and", "of", "I".   
+
+## 5. Test for accuracy and performance
+- Find an accuracy measure   
+- Monitor the reaction time of each tested algorithm and decide for a reasonable accuracy/performance tradeoff   
+
+## 6. Next steps 
+
+- Prepare the Shiny app   
+- Prepare the pitch presentation    
+
+
+
+### References:   
+General:  
+[1] **"Speech and Language Processing"**, Jurafsky & Martin, 28.08.2017, Chapter 4, https://web.stanford.edu/~jurafsky/slp3/ed3book.pdf  
+[2] **"Language Modeling Course Videos - Stanford NLP - Professor Dan Jurafsky & Chris Manning"**, https://www.youtube.com/watch?v=s3kKlUBa3b0    
+[3] **"NLP Lunch Tutorial: Smoothing"**, Bill MacCartney, 21.04.2005, https://nlp.stanford.edu/~wcmac/papers/20050421-smoothing-tutorial.pdf   
+[4] **"Word Prediction Using Stupid Backoff With a 5-gram Language Model"**, Phil Ferriere, April 2016,   https://rpubs.com/pferriere/dscapreport  
+
+Katz Backoff:  
+[5] **"Katz's back-off model"** on Wikipedia, https://en.wikipedia.org/wiki/Katz%27s_back-off_model  
+[6] **Estimation of Probabilities from Sparse Data for the Language Model Component of a Speech Recognizer**, Slava M. Katz, 03.03.1987, http://l2r.cs.uiuc.edu/~danr/Teaching/CS546-09/Papers/Katz87.pdf     
+[7] **Katz's Backoff Model Implementation in R**, Thach-Ngoc TRAN, 12.04.2016, https://thachtranerc.wordpress.com/2016/04/12/katzs-backoff-model-implementation-in-r/  
+[8] **Github repository of code for Katz Backoff**, Thach-Ngoc TRAN, 12.04.2016, https://github.com/ThachNgocTran/KatzBackOffModelImplementationInR  
+
+Good-Turing:  
+[9] **"Good-Turing frequency estimation"** on Wikipedia, https://en.wikipedia.org/wiki/Good%E2%80%93Turing_frequency_estimation   
+
+Stupid backoff:  
+[10] **"Large language models in machine translation"** by Thorsten Brants et al, in EMNLP/CoNLL 2007, http://www.aclweb.org/anthology/D07-1090.pdf  
+
+
+[11] Next word prediction benchmark @ https://github.com/hfoffani/dsci-benchmark  
+

@@ -1,0 +1,556 @@
+---
+title: "2_PredNext_Prepare_FullDataSet"
+author: "xvalda"
+date: "05 February 2018"
+output: html_document
+pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+
+## 1. Summary
+The second stage of the project consists in preparing the full datasets, using all data made available.  
+
+## 2. Housekeeping tasks
+- Allocating more Java RAM usage for the code to run smoothly  
+- Loading libraries: tm for pre-processing text data, tokenizers for tokenizing sentences, and tidytext to create ngrams without resorting to term-document matrices that would exceed the memory size.  
+
+```{r}
+#The following controls Java heap size, meaning allowed Java RAM usage. We increase default value to 8G as dealing with text treatment can computationally intensive.   
+options(java.parameters = "-Xmx8g")
+
+setwd("C:/Users/Xavier/Documents/DataScienceCourses/Coursera/Capstone")
+rm(list = ls())
+
+#loading packages, the most important being tm for text cleaning, dplyr and tidytext for tokenization. 
+library(tm); library(wordcloud); library(RWeka); library(dplyr); library(ggplot2); library(tidytext); library(dplyr)
+library(stringi); library(SnowballC); library(tokenizers); library(knitr)
+```
+
+## 3. Load source data
+
+I show the code I used but don't run it in the Rmd file as it took a total of about 6 hours to run on my system (7700K quadcore processor overclocking to 4.5 Mhz, 32GB RAM).
+I plan to reuse the code though to process datasets in other languages than English.   
+
+```{r eval=FALSE}
+twitter <- readLines("final/en_US/en_US.twitter.txt", encoding = "UTF-8", skipNul=TRUE)
+blogs <- readLines("final/en_US/en_US.blogs.txt", encoding = "UTF-8")
+con_news <- file("final/en_US/en_US.news.txt", open = "rb")
+news <- readLines(con_news, encoding="UTF-8")
+close(con_news); rm(con_news)
+```
+
+## 4. Tokenize per sentence
+
+Since we want to predict the next work in a sentence, we work on a per-sentence basis, hence the sentence tokenization. We could envisage in the future an application that could predict what the next sentence could be, but this it out o the scope of this project.   
+We use the tokenize_sentences() function from the tonekizers function. 
+
+```{r eval=FALSE}
+#Tokenize per sentence for blogs, news and twitter:  
+blogs <- unlist(tokenize_sentences(blogs))
+news <- unlist(tokenize_sentences(news))
+twitter <- unlist(tokenize_sentences(twitter))
+#Merge all data in a single file
+allData <- c(blogs, news, twitter)
+#Remove all variables except the newly created allData object:
+rm(list=setdiff(ls(), c("allData")))
+```
+
+## 5. Divide the whole dataset into 20 shorter sets, in order to process the operations in smaller batches
+
+```{r eval=FALSE}
+set.seed(50801)
+#create numeric vector the length of the dataset, permute/randomize the order and assign to object all_indices: 
+all_indices <- sample(1:length(allData), length(allData), replace = FALSE) 
+#create an empty list that stores indices of the 20 samples
+sample_indicesX20 <- list()
+#duplicate all_indices variable in index_loop variable, will be used in the for loop below
+index_loop <- all_indices
+#Run the for loop that will assign "length(all_indices)/20" indices to each of the 20 items of the list
+#The 20th item of the list may have a different number of indices, which is why the else statement takes the remaining indices in the index_loop object
+for(i in 1:20){
+  if(i != 20){
+    sample_indicesX20[[i]] <- index_loop[1:(length(all_indices)/20)]
+  }else{
+    sample_indicesX20[[i]] <- index_loop
+  }
+  #assign/create a numeric vector for each of the 20 iterations of i, an object containing random indices without replacement in the form of index1, index2, ...
+  assign(paste("index", i, sep = ""), allData[sample_indicesX20[[i]]])
+  #we substract for each iteration of the loop the indices already used so that we don't have duplicate indices 
+  index_loop <- index_loop[-(1:length(all_indices)/20)]
+} 
+#remove unnecessary variables
+rm(all_indices, i, index_loop, sample_indicesX20, allData)
+```
+
+
+## 6. Preprocessing the text 
+
+### 6.1. Load profane language database
+We choose the Google badwords.txt file, we load it and will use it with the tm package.  
+```{r eval = FALSE}
+#Download the swearWords reference file
+if(!file.exists("swearWords.txt")){
+  download.file("http://www.bannedwordlist.com/lists/swearWords.txt", "swearWords.txt", mode="wb")
+}
+swearWords <- read.table(file = "swearWords.txt",header = F,as.is = T)
+#cleaning the file manually
+swearWords <- data.frame(swearWords[nchar(swearWords[,1]) >1, 1])
+swearWords <- data.frame(swearWords[-c(12, 13, 42, 43, 44, 49, 50, 57, 66, 68),])
+swearWords <- data.frame(c(as.character(swearWords[,1]), c("fucked", "fucking", "fuckin", "fucker", "fuckers")))
+```
+
+
+### 6.2. Create the function that repeats all cleanup tasks with the tm package
+The transform_sample() function will perform the following tasks:  
+- Take the 20 lists of indices and for each, perform the transformation operations on the dataset  
+- Convert each text object to a corpus  
+- Apply transformation with the tm package: lowercase all text, remove punctuations, numbers, special characters, profane language and extra white spaces that may be generated by all the prior transformations  
+- Assign the resulting object to a variable in the global environment  
+
+```{r eval = FALSE}
+transform_samples <- function(x){
+  #convert the name of function attribute (index1, 2 ..) as character string to reuse at the end for naming the resulting object
+  name <- as.character(substitute(x))
+  #need such formating to avoid the tm package to crash on special characters, mostly found on twitter content
+  x <- iconv(x,'UTF-8', 'ASCII', "byte")
+  #converting sample dataset into a corpus 
+  sampleCorpus <- VCorpus(VectorSource(x))
+  #TRANSFORMATIONS
+  #1. convert to lower case
+  sampleCorpus <- tm_map(sampleCorpus, content_transformer(tolower))
+  #2. create toSpace() replacement function, we'll use it to replace patterns with a space
+  toSpace <- content_transformer(function(x, pattern) gsub(pattern, " ", x))
+  #3. remove URLS http first, then www, until the next space
+  sampleCorpus <- tm_map(sampleCorpus, toSpace, "http\\S*")
+  sampleCorpus <- tm_map(sampleCorpus, toSpace, "www\\S*")
+  #4. remove bad words (I needed to edit the file a little bit)
+  sampleCorpus <- tm_map(sampleCorpus, removeWords, swearWords[,1])
+  #5. remove words that contain numbers, we don't use the built-in removeNumbers function as it just removes numbers and leaves         letters behind with spaces, we decide here to remove the entire expression that contains a number
+  sampleCorpus <- tm_map(sampleCorpus, toSpace, "\\w*[0-9]+\\w*\\s*")
+  #6. Remove everything that is not a character (punctuation, special characters, numbers), except for apostrophe (I want to            distinguish "it's" from "its", or "I'll" from "ill") 
+  sampleCorpus <- tm_map(sampleCorpus, toSpace, "[^a-zA-Z|']")
+  #6. remove white space
+  sampleCorpus <- tm_map(sampleCorpus, stripWhitespace)
+
+  #"super assign" result to global environment with newly created variable in the form: "clean_sampleX"
+  assign(paste("clean_", name, sep=""), sampleCorpus, envir = .GlobalEnv)
+}
+```
+
+### 6.3. Process the text with each of the 20 samples
+
+On each of the 20 lists of indices, we perform the transformations on the corresponding text examples in the dataset, once processed, we save the file in our "data-EN" folder and remove unneccessary variables each time.  
+
+There is probably a more elegant way to do this.  
+
+```{r eval = FALSE}
+transform_samples(index1); save(clean_index1, file = "data-EN/clean_index1.Rda"); rm(index1, clean_index1)
+transform_samples(index2); save(clean_index2, file = "data-EN/clean_index2.Rda"); rm(index2, clean_index2)
+transform_samples(index3); save(clean_index3, file = "data-EN/clean_index3.Rda"); rm(index3, clean_index3)
+transform_samples(index4); save(clean_index4, file = "data-EN/clean_index4.Rda"); rm(index4, clean_index4)
+transform_samples(index5); save(clean_index5, file = "data-EN/clean_index5.Rda"); rm(index5, clean_index5)
+transform_samples(index6); save(clean_index6, file = "data-EN/clean_index6.Rda"); rm(index6, clean_index6)
+transform_samples(index7); save(clean_index7, file = "data-EN/clean_index7.Rda"); rm(index7, clean_index7)
+transform_samples(index8); save(clean_index8, file = "data-EN/clean_index8.Rda"); rm(index8, clean_index8)
+transform_samples(index9); save(clean_index9, file = "data-EN/clean_index9.Rda"); rm(index9, clean_index9)
+transform_samples(index10); save(clean_index10, file = "data-EN/clean_index10.Rda"); rm(index10, clean_index10)
+transform_samples(index11); save(clean_index11, file = "data-EN/clean_index11.Rda"); rm(index11, clean_index11)
+transform_samples(index12); save(clean_index12, file = "data-EN/clean_index12.Rda"); rm(index12, clean_index12)
+transform_samples(index13); save(clean_index13, file = "data-EN/clean_index13.Rda"); rm(index13, clean_index13)
+transform_samples(index14); save(clean_index14, file = "data-EN/clean_index14.Rda"); rm(index14, clean_index14)
+transform_samples(index15); save(clean_index15, file = "data-EN/clean_index15.Rda"); rm(index15, clean_index15)
+transform_samples(index16); save(clean_index16, file = "data-EN/clean_index16.Rda"); rm(index16, clean_index16)
+transform_samples(index17); save(clean_index17, file = "data-EN/clean_index17.Rda"); rm(index17, clean_index17)
+transform_samples(index18); save(clean_index18, file = "data-EN/clean_index18.Rda"); rm(index18, clean_index18)
+transform_samples(index19); save(clean_index19, file = "data-EN/clean_index19.Rda"); rm(index19, clean_index19)
+transform_samples(index20); save(clean_index20, file = "data-EN/clean_index20.Rda"); rm(index20, clean_index20)
+#remove all variables from the working environment
+rm(list = ls())
+
+```
+
+## 7. Generate NGrams
+
+We will create lists of all unigrams, bigrams, trigrams, fourgrams and fivegrams.  
+The end result must be 5 data frames, one per n-gram, with 2 variables each: actual words (ngrams) and their frequency across all documents.  
+There are several ways to do this, a popular one is using the tm and RWeka packages. The process consists in creating a term-document frequency matrix, and reducing it to a simple data frame by summing all occurences of the each ngram. This solution is computationally intensive and requires too much memory.  
+Since our end purpose is a data frame showing the frequency, we prefer to use the tidytext package that can attain the end result in a much quicker way.  
+
+After some trial and errors, we opted for the following methodology:  
+1. we have 20 cleaned up text corpus, "clean_index1" to ... "clean_index20".  
+2. we will process 2 batches of 10 datasets  
+3. apply the genData() function for each of these 2 btaches, with the following actions:  
+- convert corpus to a data frame  
+- extract unigram, get their frequency and sort them (unnest_token() + count() functions from the tidytext package)  
+- merge each newly created dataframe with the previous one in the batch, summing counts of ngrams  
+- repeat the process for bigrams, trigrams, fourgrams and fivegrams   
+4. 10 objects will be created, df_1gram_b1 (first batch of 10 corpus merged into a data frame with all unigrams and their summed up counts), ... to ... df_5gram_b2.  
+5. We merge the X_b1 and X_b2 data frames in order to have a unique data frame per ngram, so we end up with 5 dataframes showing ALL ngrams and their counts across the whole dataset: df_1gram, df_2gram, df_3gram, df_4gram, df_5gram.  
+6. We'll save these datasets to use in the third part of the project, the acual algorithms. Of course we will filter the datasets to show only ngrams with a threshold frequency as our datasets here will be very large and cannot be practically used.  
+
+### 7.1. Preparing the genData() function
+
+```{r eval = FALSE}
+#initializing empty data frames to hold ngram datasets
+df_1gram_b1 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+df_2gram_b1 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+df_3gram_b1 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+df_4gram_b1 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+df_5gram_b1 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+
+df_1gram_b2 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+df_2gram_b2 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+df_3gram_b2 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+df_4gram_b2 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+df_5gram_b2 <- data.frame(ngrams = "", n = 0, stringsAsFactors = FALSE)
+
+#genData1() function for processing the first batch of 10 corpus, clean_index1 to clean_index10
+
+genData1 <- function(t){
+  #convert t to a data frame
+  t <- data.frame(unlist(lapply(t[1:length(t)], as.character))); names(t) <- "texts"
+  #transform factor to character vector
+  t$texts <- as.character(t$texts)
+  #process unigrams
+  t1 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 1)
+  #create unigram frequency and sort them
+  t1 <- t1 %>%
+    count(ngrams, sort = TRUE) 
+  t1 <- as.data.frame(t1)
+  df_1gram_b1 <<- merge(df_1gram_b1, t1, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_1gram_b1 <<- data.frame(ngrams = df_1gram_b1$ngrams, n = rowSums(df_1gram_b1[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+  #process bigrams
+  t2 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 2)
+  t2 <- t2 %>%
+    count(ngrams, sort = TRUE) 
+  t2 <- as.data.frame(t2)
+  df_2gram_b1 <<- merge(df_2gram_b1, t2, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_2gram_b1 <<- data.frame(ngrams = df_2gram_b1$ngrams, n = rowSums(df_2gram_b1[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+  #process trigrams
+  t3 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 3)
+  t3 <- t3 %>%
+    count(ngrams, sort = TRUE) 
+  t3 <- as.data.frame(t3)
+  df_3gram_b1 <<- merge(df_3gram_b1, t3, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_3gram_b1 <<- data.frame(ngrams = df_3gram_b1$ngrams, n = rowSums(df_3gram_b1[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+  #process fourgrams
+  t4 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 4)
+  t4 <- t4 %>%
+    count(ngrams, sort = TRUE) 
+  t4 <- as.data.frame(t4)
+  df_4gram_b1 <<- merge(df_4gram_b1, t4, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_4gram_b1 <<- data.frame(ngrams = df_4gram_b1$ngrams, n = rowSums(df_4gram_b1[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+  #process fivegrams
+  t5 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 5)
+  t5 <- t5 %>%
+    count(ngrams, sort = TRUE) 
+  t5 <- as.data.frame(t5)
+  df_5gram_b1 <<- merge(df_5gram_b1, t5, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_5gram_b1 <<- data.frame(ngrams = df_5gram_b1$ngrams, n = rowSums(df_5gram_b1[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+}
+
+#genData2() function for processing the first batch of 10 corpus, clean_index11 to clean_index20
+
+genData2 <- function(t){
+  #convert t to a data frame
+  t <- data.frame(unlist(lapply(t[1:length(t)], as.character))); names(t) <- "texts"
+  #transform factor to character vector
+  t$texts <- as.character(t$texts)
+  #process unigrams
+  t1 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 1)
+  #create unigram frequency and sort them
+  t1 <- t1 %>%
+    count(ngrams, sort = TRUE) 
+  t1 <- as.data.frame(t1)
+  df_1gram_b2 <<- merge(df_1gram_b2, t1, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_1gram_b2 <<- data.frame(ngrams = df_1gram_b2$ngrams, n = rowSums(df_1gram_b2[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+  #process bigrams
+  t2 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 2)
+  t2 <- t2 %>%
+    count(ngrams, sort = TRUE) 
+  t2 <- as.data.frame(t2)
+  df_2gram_b2 <<- merge(df_2gram_b2, t2, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_2gram_b2 <<- data.frame(ngrams = df_2gram_b2$ngrams, n = rowSums(df_2gram_b2[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+  #process trigrams
+  t3 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 3)
+  t3 <- t3 %>%
+    count(ngrams, sort = TRUE) 
+  t3 <- as.data.frame(t3)
+  df_3gram_b2 <<- merge(df_3gram_b2, t3, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_3gram_b2 <<- data.frame(ngrams = df_3gram_b2$ngrams, n = rowSums(df_3gram_b2[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+  #process fourgrams
+  t4 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 4)
+  t4 <- t4 %>%
+    count(ngrams, sort = TRUE) 
+  t4 <- as.data.frame(t4)
+  df_4gram_b2 <<- merge(df_4gram_b2, t4, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_4gram_b2 <<- data.frame(ngrams = df_4gram_b2$ngrams, n = rowSums(df_4gram_b2[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+  #process fivegrams
+  t5 <- t %>%
+    unnest_tokens(ngrams, texts, token = "ngrams", n = 5)
+  t5 <- t5 %>%
+    count(ngrams, sort = TRUE) 
+  t5 <- as.data.frame(t5)
+  df_5gram_b2 <<- merge(df_5gram_b2, t5, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+  df_5gram_b2 <<- data.frame(ngrams = df_5gram_b2$ngrams, n = rowSums(df_5gram_b2[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+}
+
+```
+
+### 7.2. Running the function
+
+For each of the two batches, we load each of the 10 files, store the content in the variable t, launch the function that will create the ngrams and merge them with other ngrams from the same batch, and delete all variables except the ngrams dataframes and the function itself.  
+We added a counttable to record how many rows each of the ngram tables have after adding each new ngram file. We may need that information in later stages.  
+
+```{r eval = FALSE}
+
+#initialize count table to show how many ngrams were added at each stage (meaning at each of the 10 samples used) 
+countTable1 <- data.frame(matrix(nrow = 10, ncol = 5)); names(countTable1) <- c("df1", "df2", "df3", "df4", "df5")
+countTable2 <- data.frame(matrix(nrow = 10, ncol = 5)); names(countTable2) <- c("df1", "df2", "df3", "df4", "df5")
+
+#Batch 1, process 10 files
+load("data-EN/clean_index1.Rda"); t <- clean_index1; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[1,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index2.Rda"); t <- clean_index2; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[2,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index3.Rda"); t <- clean_index3; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[3,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index4.Rda"); t <- clean_index4; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[4,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index5.Rda"); t <- clean_index5; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[5,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index6.Rda"); t <- clean_index6; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[6,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index7.Rda"); t <- clean_index7; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[7,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index8.Rda"); t <- clean_index8; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[8,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index9.Rda"); t <- clean_index9; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[9,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1]) 
+load("data-EN/clean_index10.Rda"); t <- clean_index10; genData1(t); rm(list=setdiff(ls(), c("df_1gram_b1", "df_2gram_b1", "df_3gram_b1", "df_4gram_b1", "df_5gram_b1", "genData1", "countTable1", "genData2", "countTable2")))
+countTable1[10,] <- c(dim(df_1gram_b1)[1],dim(df_2gram_b1)[1], dim(df_3gram_b1)[1], dim(df_4gram_b1)[1], dim(df_5gram_b1)[1])
+
+#Batch 2, process 10 last files
+load("data-EN/clean_index11.Rda"); t <- clean_index11; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[11,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index12.Rda"); t <- clean_index12; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[12,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index13.Rda"); t <- clean_index13; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[13,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index14.Rda"); t <- clean_index14; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[14,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index15.Rda"); t <- clean_index15; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[15,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index16.Rda"); t <- clean_index16; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[16,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index17.Rda"); t <- clean_index17; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[17,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index18.Rda"); t <- clean_index18; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[18,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index19.Rda"); t <- clean_index19; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[19,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1]) 
+load("data-EN/clean_index20.Rda"); t <- clean_index20; genData2(t); rm(list=setdiff(ls(), c("df_1gram_b2", "df_2gram_b2", "df_3gram_b2", "df_4gram_b2", "df_5gram_b2", "genData2", "countTable2")))
+countTable2[20,] <- c(dim(df_1gram_b2)[1],dim(df_2gram_b2)[1], dim(df_3gram_b2)[1], dim(df_4gram_b2)[1], dim(df_5gram_b2)[1])
+```
+
+
+### 7.3. Merge the two resulting dataframes together
+
+The last step consists in taking for each of the 5 ngrams, the two files we processed and merge them together. Not that it would have been easier to do it all in one go from the very beginning, but due to memory and performance issues, after some trial and error, this was proved to be the quickest and error-free solution.  
+
+```{r eval=FALSE}
+#MERGE THE DATA FILES
+rm(list = ls())
+#unigrams
+load("data-EN/df_1gram_b1.Rda"); load("data-EN/df_1gram_b2.Rda")
+df_1gram <- merge(df_1gram_b1, df_1gram_b2, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+rm(df_1gram_b1, df_1gram_b2)
+df_1gram <- data.frame(ngrams = df_1gram$ngrams, n = rowSums(df_1gram[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+save(df_1gram, file = "data-EN/df_1gram.Rda")
+
+#bigrams
+rm(list = ls())
+load("data-EN/df_2gram_b1.Rda"); load("data-EN/df_2gram_b2.Rda")
+df_2gram <- merge(df_2gram_b1, df_2gram_b2, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+rm(df_2gram_b1, df_2gram_b2)
+df_2gram <- data.frame(ngrams = df_2gram$ngrams, n = rowSums(df_2gram[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+save(df_2gram, file = "data-EN/df_2gram.Rda")
+
+#trigrams
+rm(list = ls())
+load("data-EN/df_3gram_b1.Rda"); load("data-EN/df_3gram_b2.Rda")
+df_3gram <- merge(df_3gram_b1, df_3gram_b2, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+rm(df_3gram_b1, df_3gram_b2)
+df_3gram <- data.frame(ngrams = df_3gram$ngrams, n = rowSums(df_3gram[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+save(df_3gram, file = "data-EN/df_3gram.Rda")
+
+#fourgrams
+rm(list = ls())
+load("data-EN/df_4gram_b1.Rda"); load("data-EN/df_4gram_b2.Rda")
+df_4gram <- merge(df_4gram_b1, df_4gram_b2, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+rm(df_4gram_b1, df_4gram_b2)
+df_4gram <- data.frame(ngrams = df_4gram$ngrams, n = rowSums(df_4gram[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+save(df_4gram, file = "data-EN/df_4gram.Rda")
+
+#fivegrams
+rm(list = ls())
+load("data-EN/df_5gram_b1.Rda"); load("data-EN/df_5gram_b2.Rda")
+df_5gram <- merge(df_5gram_b1, df_5gram_b2, by = "ngrams", all = TRUE, stringsAsFactors = FALSE)
+rm(df_5gram_b1, df_5gram_b2)
+df_5gram <- data.frame(ngrams = df_5gram$ngrams, n = rowSums(df_5gram[,-1], na.rm = TRUE), stringsAsFactors = FALSE)
+save(df_5gram, file = "data-EN/df_5gram.Rda")
+```
+
+## 8. Preparing the datasets
+
+We have now 5 datasets, one per ngram: unigrams, bigrams, trigrams, fourgrams and fivegrams.   
+As mentioned in the milestone report (1_PredNext_Milsetone_Report - Word prediction with n-grams), the large size of the datasets makes it hard to use for the prediction models.   
+
+Trimming the ngrams with low frequency will help reduce the size tremendously while not impacting the predictive value since low frequency ngrams will have almost no chance of being shown i the predictions.   
+
+Deciding at which ngram frequency level to trim the datasets is arbitrary, it takes some manual exploration of some of the instances and deciding which final dataset size we want to achieve.   
+
+```{r, echo = FALSE}
+load("data-EN/df_1gram.Rda")
+load("data-EN/df_2gram.Rda")
+load("data-EN/df_3gram.Rda")
+load("data-EN/df_4gram.Rda")
+load("data-EN/df_5gram.Rda")
+```
+
+```{r}
+unigrams_size <- paste(round(file.info("data-EN/df1_gram.Rda")$size /2^20, 2), "MB")
+bigrams_size <- paste(round(file.info("data-EN/df2_gram.Rda")$size /2^20, 2), "MB")
+trigrams_size <- paste(round(file.info("data-EN/df3_gram.Rda")$size /2^20, 2), "MB")
+fourgrams_size <- paste(round(file.info("data-EN/df4_gram.Rda")$size /2^20, 2), "MB")
+fivegrams_size <- paste(round(file.info("data-EN/df5_gram.Rda")$size /2^20, 2), "MB")
+
+#get qty ngrams 
+unigrams_length <- dim(df_1gram)[1]
+bigrams_length <- dim(df_2gram)[1]
+trigrams_length <- dim(df_3gram)[1]
+fourgrams_length <- dim(df_4gram)[1]
+fivegrams_length <- dim(df_5gram)[1]
+
+#collate info in data frame, rename rows, format numbers 
+summary <- data.frame(FileSize = c(unigrams_size, bigrams_size, trigrams_size, fourgrams_size, fivegrams_size), QtyNgrams = c(unigrams_length, bigrams_length, trigrams_length, fourgrams_length, fivegrams_length))
+rownames(summary) <- c("Unigrams", "Bigrams", "Trigrams", "Fourgrams", "Fivegrams")
+summary$QtyNgrams <- formatC(summary$QtyNgrams, big.mark = ",", format = "f", digits = 0)
+#Display in a table 
+kable(summary)
+```
+
+
+```{r}
+#frequency counts tables with 3 values: 
+#Frequency (number of times an ngram appears in the dataset) 
+#Count (how many ngrams correspond to this frequency) 
+#Perc (pecentage of ngrams with a specific frequency over all ngrams/frequencies in the dataset)
+unigrams_freqs <- data.frame(table(df_1gram$n))
+bigrams_freqs <- data.frame(table(df_2gram$n))
+trigrams_freqs <- data.frame(table(df_3gram$n))
+fourgrams_freqs <- data.frame(table(df_4gram$n))
+fivegrams_freqs <- data.frame(table(df_5gram$n))
+#create the Perc variable 
+unigrams_freqs$Perc <- unigrams_freqs$Freq/sum(unigrams_freqs$Freq)
+bigrams_freqs$Perc <- bigrams_freqs$Freq/sum(bigrams_freqs$Freq)
+trigrams_freqs$Perc <- trigrams_freqs$Freq/sum(trigrams_freqs$Freq)
+fourgrams_freqs$Perc <- fourgrams_freqs$Freq/sum(fourgrams_freqs$Freq)
+fivegrams_freqs$Perc <- fivegrams_freqs$Freq/sum(fivegrams_freqs$Freq)
+#rename variables
+names(unigrams_freqs) <- c("Frequency", "Count", "Perc")
+names(bigrams_freqs) <- c("Frequency", "Count", "Perc")
+names(trigrams_freqs) <- c("Frequency", "Count", "Perc")
+names(fourgrams_freqs) <- c("Frequency", "Count", "Perc")
+names(fivegrams_freqs) <- c("Frequency", "Count", "Perc")
+#tables
+kable(head(unigrams_freqs))
+kable(head(bigrams_freqs))
+kable(head(trigrams_freqs))
+
+```
+
+By setting the threshold to frequency 5 for instance, we would reduce the file size and ngrams by:   
+- `r round(sum(unigrams_freqs[1:4,3]), 4)*100`% for unigrams,   
+- `r round(sum(bigrams_freqs[1:4,3]), 4)*100`% for bigrams,   
+- `r round(sum(trigrams_freqs[1:4,3]), 4)*100`% for trigrams,   
+- `r round(sum(fourgrams_freqs[1:4,3]), 4)*100`% for fourgrams and   
+- `r round(sum(fivegrams_freqs[1:4,3]), 4)*100`% for fivegrams.   
+
+This is far from being exhautsive, but I explored the low frequency ngrams in the dataset to get a better feel of what will be excluded from the predictive model.   
+
+```{r}
+#trimming datasets with ngram frequencies less than 5
+dat1 <- df_1gram %>%
+  filter(n > 4)
+dat2 <- df_2gram %>%
+  filter(n > 4)
+dat3 <- df_3gram %>%
+  filter(n > 4)
+dat4 <- df_4gram %>%
+  filter(n > 4)
+dat5 <- df_5gram %>%
+  filter(n > 4)
+```
+
+
+```{r, eval = FALSE}
+#Save datasets
+save(dat1, file = "data-EN/dat1.txt")
+save(dat2, file = "data-EN/dat2.txt")
+save(dat3, file = "data-EN/dat3.txt")
+save(dat4, file = "data-EN/dat4.txt")
+save(dat5, file = "data-EN/dat5.txt")
+```
+
+
+```{r}
+unigrams_size <- paste(round(file.info("data-EN/dat1.Rda")$size /2^20, 2), "MB")
+bigrams_size <- paste(round(file.info("data-EN/dat2.Rda")$size /2^20, 2), "MB")
+trigrams_size <- paste(round(file.info("data-EN/dat3.Rda")$size /2^20, 2), "MB")
+fourgrams_size <- paste(round(file.info("data-EN/dat4.Rda")$size /2^20, 2), "MB")
+fivegrams_size <- paste(round(file.info("data-EN/dat5.Rda")$size /2^20, 2), "MB")
+
+#get qty ngrams 
+unigrams_length <- dim(dat1)[1]
+bigrams_length <- dim(dat2)[1]
+trigrams_length <- dim(dat3)[1]
+fourgrams_length <- dim(dat4)[1]
+fivegrams_length <- dim(dat5)[1]
+
+#collate info in data frame, rename rows, format numbers 
+summary <- data.frame(FileSize = c(unigrams_size, bigrams_size, trigrams_size, fourgrams_size, fivegrams_size), QtyNgrams = c(unigrams_length, bigrams_length, trigrams_length, fourgrams_length, fivegrams_length))
+rownames(summary) <- c("Unigrams", "Bigrams", "Trigrams", "Fourgrams", "Fivegrams")
+summary$QtyNgrams <- formatC(summary$QtyNgrams, big.mark = ",", format = "f", digits = 0)
+#Display in a table 
+kable(summary)
+```
+
+In term of lines and file size, these datasets are much more reasonable. We will use then dat1, ..., dat5 for our predictive models.  
+
+
+## 9. Conclusion and next steps
+
+We decided to use all the data at our disposal to create our initial ngram training sets. We opted for processing this in batches for several reasons:  
+- performance and memory efficiency.  
+- in case of an error, we do not need to wait that the whole data is processed (which can take more than 24 hours depending on the systems), just using a partition of the data allows us to detect issues and undertake corrective actions without losing time.  
+- We may change our strategy later on and only use part of the data, in this eventuality, we have our dataset already partitioned, pre-processed, and selected with a random pattern.   
+
+The next documeent in this project (3_PredNext_Language_Models) will go through the explanation of the language models chosen and the code to be included in the shiny app.   
+
+
+
+

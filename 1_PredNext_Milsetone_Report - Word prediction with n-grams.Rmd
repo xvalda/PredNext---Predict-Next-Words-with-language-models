@@ -1,0 +1,365 @@
+---
+title: "1_PredNext_Milsetone_Report - Word prediction with n-grams"
+author: "xvalda"
+date: "31 January 2018"
+output: html_document
+pdf_document: default
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+## Summary
+
+The capstone project of the Coursera Data Science Specialization deals with NLP (Natural Language Processing) and proposes to create an application from scratch that takes user text input and predicts the next word in the sentence, similar to the SwiftKey technology.  
+
+**Goals of this milestone report:**  
+Load in the data, basic summary statistics about the data sets, interesting findings and plan for creating a prediction algorithm and Shiny app.  
+
+##Load packages
+```{r load-packages, message=FALSE, warning=FALSE}
+library(tm); library(dplyr); library(ggplot2); library(stringi); library(stringr); library(tokenizers); library(tidytext); library(knitr)
+```
+
+## 1. Data - loading and basic summary
+
+The data can be found [here]("https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"). We assume that the user downloaded and unzipped the data, and placed it into the working directory, retaining the folder structure.  
+
+Datasets are available in English, Finnish, German, and Russian.  
+We use only English data for this exploratory phase, using the twitter, blog and news datasets.   
+
+**Load the data.**   
+```{r}
+#loading twitter and blogs data
+twitter <- readLines("final/en_US/en_US.twitter.txt", encoding = "UTF-8", skipNul=TRUE)
+blogs <- readLines("final/en_US/en_US.blogs.txt", encoding = "UTF-8")
+#loading news dataset using "rb" (read binary) attribute
+con_news <- file("final/en_US/en_US.news.txt", open = "rb")
+news <- readLines(con_news, encoding="UTF-8")
+close(con_news); rm(con_news)
+```
+
+
+**Tokenize per sentence**  
+The purpose of the application is to predict the next word within a sentence, not how the next sentence will start. Therefore the base unit for the examples to train the model on should be sentences and not full blogs or news articles.  
+
+I use the "tokenizers" package to divide the text into sentences.  
+```{r}
+#tokenize per sentence as a first step
+blogs <- unlist(tokenize_sentences(blogs))
+news <- unlist(tokenize_sentences(news))
+twitter <- unlist(tokenize_sentences(twitter))
+```
+
+**Perform basic word and line count summary.**  
+
+```{r}
+#file sizes
+blogsSize <- paste(round(file.info("final/en_US/en_US.blogs.txt")$size /2^20, 2), "MB")
+newsSize <- paste(round(file.info("final/en_US/en_US.news.txt")$size /2^20, 2), "MB")
+twitterSize <- paste(round(file.info("final/en_US/en_US.twitter.txt")$size /2^20, 2), "MB")
+totalSize <- paste(round((file.info("final/en_US/en_US.blogs.txt")$size + file.info("final/en_US/en_US.news.txt")$size + file.info("final/en_US/en_US.twitter.txt")$size) /2^20, 2), "MB")
+#lines in each file
+blogsLength <- length(blogs)
+newsLength <- length(news)
+twitterLength <- length(twitter)
+totalLength <- blogsLength + newsLength + twitterLength
+#word count per file (from stringi package)
+blogsWC <- stri_stats_latex(blogs)[[4]]
+newsWC <- stri_stats_latex(news)[[4]]
+twitterWC <- stri_stats_latex(twitter)[[4]]
+totalWC <- blogsWC + newsWC + twitterWC
+#average words per sentence
+blogsAveWords <- ceiling(blogsWC/blogsLength)
+newsAveWords <- ceiling(newsWC/newsLength)
+twitterAveWords <- ceiling(twitterWC/twitterLength)
+totalAveWords <- ceiling(totalWC/totalLength)
+#summarize in a table
+summary <- data.frame(File_Size = c(blogsSize, newsSize, twitterSize, totalSize), Lines = c(blogsLength, newsLength, twitterLength, totalLength), Total_Words = c(blogsWC, newsWC, twitterWC, totalWC), Mean_Words_perLine = c(blogsAveWords, newsAveWords, twitterAveWords, totalAveWords), row.names = c("blogs", "news", "twitter", "total"))
+#Format the numbers
+summary$Lines <- formatC(summary$Lines, big.mark = ",", format = "f", digits = 0)
+summary$Total_Words <- formatC(summary$Total_Words, big.mark = ",", format = "f", digits = 0)
+#Show in a table
+kable(summary)
+```
+
+The word count per line is pretty homogeneous for blogs and news, and a bit less for twitter.     
+
+The main takeaway is the large size of the dataset with `r formatC(totalWC, big.mark = ",", format = "f", digits = 0)` words, `r formatC(totalLength, big.mark = ",", format = "f", digits = 0)` lines of text and a total size of `r formatC(totalSize, big.mark = ",", format = "f", digits = 0)`. This is a lot and in order to make the exploration phase not too computationtally intensive, we choose a sample of 10% of the total lines.  
+
+**Sampling 10% of the lines of each dataset **  
+
+```{r}
+#remove unnecessary variables, we keep only blogs, news and twitter. 
+rm(list=setdiff(ls(), c("blogs", "news", "twitter")))
+#create samples per page type, 10% text mentions of each dataset
+set.seed(23456)
+blogsSample <- blogs[sample(1:length(blogs),length(blogs)/10)]
+#convert character vector from UTF-8 to ASCII format, this command is needed for the tm package to work properly 
+blogsSample <- iconv(blogsSample,'UTF-8', 'ASCII', "byte")
+newsSample <- news[sample(1:length(news),length(news)/10)]
+newsSample <- iconv(newsSample,'UTF-8', 'ASCII', "byte")
+twitterSample <- twitter[sample(1:length(twitter),length(twitter)/10)]
+twitterSample <- iconv(twitterSample,'UTF-8', 'ASCII', "byte")
+#remove the source variables
+rm(blogs, news, twitter)
+#merge all samples into one data file
+sampleData <- c(blogsSample, newsSample, twitterSample)
+#save the sampleData file
+writeLines(sampleData, "sampleData.txt")
+#remove unnecessary objects
+rm(blogsSample, newsSample, twitterSample)
+```
+
+##2. Cleaning the data using the tm package
+
+The tm package offers the following functions to process NLP tasks:  
+- Corpus() converts the dataset in corpora, collections of documents containing natural language text.  
+- tm_map() and content_transformer() create and apply functions which modify the content of the corpus for text cleaning tasks.  
+
+We will perform cleaning operations in the following order:  
+- lowercase the whole text (we want to avoid lower- and uppercase variations of the same word in order to save space)  
+- remove urls (by removing every string that starts with http... and www..., until the next white space)   
+- remove profanity: we don't want to recommend any offending words and remove profanity by loading the bannedwordlist.com "swearWords.txt" file.   
+- remove numbers, since we want to predict text and not numbers. Instead of the built-in removeNumbers() function, we use a custom function that removes the entire word containing a number so that we don't leave behind meaningless characters.   
+- remove special characters and punctuation, keep apostrophes: we don't use the built-in functions for this, but simply remove everything that is not a character ([^a-zA-Z]) or that is not an apostrophe.   
+- remove blanks between the words: our transformations may have left more than one space between words, we remove them as a last step.     
+
+We decided not to run some text cleaning tasks that are usual to NLP:  
+- Apostrophes: we decided to keep them since we don't want to confuse "it's" and "its", or "I'll" and "ill".   
+- Stemming, meaning converting words to their root form (learning, learner, learned, ... --> "learn"): we want to predict the next words for this project and we don't want to predict only the root of the word.     
+- Stopwords: these are articles or basic verbs very common in the language: a, the, she, he, you, ... In NLP they are considered to hold a poor predictive value since they're overwhelmingly present and show little semantic interest, but for predicicting the next words, and considering strings of 2, 3 or more words, they regain all their importance.   
+
+```{r}
+#converting sample dataset into a corpus 
+sampleCorpus <- VCorpus(VectorSource(sampleData))
+#1. lowercase all text
+sampleCorpus <- tm_map(sampleCorpus, content_transformer(tolower))
+#2. create replacement function, replace a pattern with a space
+toSpace <- content_transformer(function(x, pattern) gsub(pattern, " ", x))
+#3. remove URLS http first, then www, until the next space
+sampleCorpus <- tm_map(sampleCorpus, toSpace, "http\\S*")
+sampleCorpus <- tm_map(sampleCorpus, toSpace, "www\\S*")
+#4. remove bad words (I needed to edit the file a little bit)
+if(!file.exists("swearWords.txt")){
+  download.file("http://www.bannedwordlist.com/lists/swearWords.txt", "swearWords.txt", mode="wb")
+}
+swearWords <- read.table(file = "swearWords.txt",header = F,as.is = T)
+swearWords <- data.frame(swearWords[nchar(swearWords[,1]) >1, 1])
+swearWords <- data.frame(swearWords[-c(12, 13, 42, 43, 44, 49, 50, 57, 66, 68),])
+swearWords <- data.frame(c(as.character(swearWords[,1]), c("fucked", "fucking", "fuckin", "fucker", "fuckers")))
+sampleCorpus <- tm_map(sampleCorpus, removeWords, swearWords[,1])
+#5. Remove words that contain numbers, not just the numbers since it may leave letters without any meaning
+sampleCorpus <- tm_map(sampleCorpus, toSpace, "\\w*[0-9]+\\w*\\s*")
+#6. Remove everything that is not a character (punctuation, special characters, numbers), except for apostrophe (I want to distinguish "it's" from "its", or "I'll" from "ill") 
+sampleCorpus <- tm_map(sampleCorpus, toSpace, "[^a-zA-Z|']")
+#6. remove white space
+sampleCorpus <- tm_map(sampleCorpus, stripWhitespace)
+#remove unnecessary variables
+rm(sampleData, swearWords, toSpace)
+save(sampleCorpus, file = "sampleCorpus.Rda")
+```
+
+Now we can do a quick check, did all our transformations provide a sensible result? We take a few random lines.
+```{r, echo = FALSE, eval = FALSE}
+#load("sampleCorpus.Rda")
+```
+
+```{r}
+lapply(sampleCorpus[20:23], as.character)
+```
+
+##3.1 Tokenizing with the tidytext package
+
+We create unigrams (each word isolated, showing their frequency across all lines or sentences of the corpus), bigrams (a sequence of two consecutive words), and trigrams. We will stop at the trigrams although additional n-grams will be considered in the second phase of the project.    
+
+The RWeka package is often used for this, but it requires the extra step of creating a term document frequency matrix (each row is a line of text, each column is an ngram). We finally reduce it to a word frequency data frame across all documents (each ngram with its count/sum across all documents in the corpus). Since we do not need a term document matrix and the extra step costs a lot of memory, we use instead the tidytext package that allows us to directly create a frequency table.  
+
+```{r}
+#transform corpus into a data frame that the tidytext package can understand
+sample_df <- data.frame(unlist(lapply(sampleCorpus[1:length(sampleCorpus)], as.character)))
+#rename the column
+names(sample_df) <- "texts"
+
+#unigrams
+#create unigrams with the unnest_tokens() function
+unigrams <- sample_df %>%
+  unnest_tokens(ngrams, texts, token = "ngrams", n = 1)
+#calculate frequency for each unigram, and sort the data frame in descending order
+unigrams <- unigrams %>%
+  count(ngrams, sort = TRUE) 
+
+#bigrams
+bigrams <- sample_df %>%
+  unnest_tokens(ngrams, texts, token = "ngrams", n = 2)
+bigrams <- bigrams %>%
+  count(ngrams, sort = TRUE) 
+
+#trigrams
+trigrams <- sample_df %>%
+  unnest_tokens(ngrams, texts, token = "ngrams", n = 3)
+trigrams <- trigrams %>%
+  count(ngrams, sort = TRUE) 
+```
+
+Saving our three datasets: 
+```{r}
+save(unigrams, file = "unigrams.Rda")
+save(bigrams, file = "bigrams.Rda")
+save(trigrams, file = "trigrams.Rda")
+```
+
+Now that we have our three objects to work with, we can explore the datasets.   
+
+
+##3.2 Viewing results, lists and plots
+
+First we can show a frequency plot of the top 30 words for 1-grams, 2-grams, 3-grams:  
+
+```{r, echo=FALSE, eval = FALSE}
+load("unigrams.Rda"); load("bigrams.Rda"); load("trigrams.Rda")
+```
+
+```{r}
+ggplot(unigrams[1:30,], aes(x=reorder(ngrams, n), y=n)) + coord_flip() +
+  labs(x = "", y = "Frequency") + ggtitle("unigrams, top 30, by frequency") + 
+  geom_bar(stat = "identity", fill = "lightblue", colour = "darkgrey")
+
+ggplot(bigrams[1:30,], aes(x=reorder(ngrams, n), y=n)) + coord_flip() +
+  labs(x = "", y = "Frequency") + ggtitle("bigrams, top 30, by frequency") + 
+  geom_bar(stat = "identity", fill = "lightgreen", colour = "darkgrey")
+
+ggplot(trigrams[1:30,], aes(x=reorder(ngrams, n), y=n)) + coord_flip() +
+  labs(x = "", y = "Frequency") + ggtitle("trigrams, top 30, by frequency") + 
+  geom_bar(stat = "identity", fill = "beige", colour = "darkgrey")
+```
+
+Words/expressions with top frequency present no surprise and show something that could look like a stopword list, since we didn't remove them during the cleanup process. We can go a bit deeper in the list and see if terms with lower frequencies also make sense.   
+
+```{r}
+kable(data.frame(Unigrams = unigrams[900:905,], Bigrams = bigrams[900:905,], Trigrams = trigrams[900:905,]))
+```
+
+These seem to make sense as well.   
+
+
+##4. Findings 
+
+We have now three datasets we can work with to build our predictive models.  
+
+We look first at a few summary elements: 
+```{r}
+#get file size`
+unigrams_size <- paste(round(file.info("unigrams.Rda")$size /2^20, 2), "MB")
+bigrams_size <- paste(round(file.info("bigrams.Rda")$size /2^20, 2), "MB")
+trigrams_size <- paste(round(file.info("trigrams.Rda")$size /2^20, 2), "MB")
+#get qty ngrams 
+unigrams_length <- dim(unigrams)[1]
+bigrams_length <- dim(bigrams)[1]
+trigrams_length <- dim(trigrams)[1]
+#collate info in data frame, rename rows, format numbers 
+summary <- data.frame(FileSize = c(unigrams_size, bigrams_size, trigrams_size), QtyNgrams = c(unigrams_length, bigrams_length, trigrams_length))
+rownames(summary) <- c("Unigrams", "Bigrams", "Trigrams")
+summary$QtyNgrams <- formatC(summary$QtyNgrams, big.mark = ",", format = "f", digits = 0)
+#Display in a table 
+kable(summary)
+```
+
+File size and quantity of ngrams increase dramatically from unigrams to bigrams, trigrams, ...   
+We have a hunch that ngrams with low frequency (appearing only 1 or a few times) take a lot of space. We can look more into this, first by checking examples of ngrams with low frequencies.    
+
+```{r}
+head(unigrams[unigrams$n == 1,])
+head(bigrams[bigrams$n == 1,])
+```
+
+These examples of low frequency ngrams show us expressions with little or no use for our end purpose. We will want to remove ngrams with low frequency but before doing so, we can explore the distribution of the ngram frequencies.   
+
+```{r}
+#frequency counts tables with 3 values: 
+#Frequency (number of times an ngram appears in the dataset) 
+#Count (how many ngrams correspond to this frequency) 
+#Perc (pecentage of ngrams with a specific frequency over all ngrams/frequencies in the dataset)
+unigrams_freqs <- data.frame(table(unigrams$n))
+bigrams_freqs <- data.frame(table(bigrams$n))
+trigrams_freqs <- data.frame(table(trigrams$n))
+#create the Perc variable 
+unigrams_freqs$Perc <- unigrams_freqs$Freq/sum(unigrams_freqs$Freq)
+bigrams_freqs$Perc <- bigrams_freqs$Freq/sum(bigrams_freqs$Freq)
+trigrams_freqs$Perc <- trigrams_freqs$Freq/sum(trigrams_freqs$Freq)
+#rename variables
+names(unigrams_freqs) <- c("Frequency", "Count", "Perc")
+names(bigrams_freqs) <- c("Frequency", "Count", "Perc")
+names(trigrams_freqs) <- c("Frequency", "Count", "Perc")
+#plot the distribution
+ggplot(unigrams_freqs, aes(Perc)) +
+  geom_histogram(show.legend = FALSE) + 
+  xlim(NA, 0.0009) + 
+  ggtitle("Zipf Distribution of unigram frequencies")
+```
+
+Our unigram frequency tables follow long tailed distributions, which correspond to the Zipf law that is very common in large NLP corpuses: the frequeny that a word appears is inversely proportional to its rank [1].  
+
+In other words, we end up with a sparse term frequency matrix, with a very high amount of ngrams appearing only once or a few times. Not only do these low-frequency ngrams bring very little predictive value to the model, but they also increase dramatically the size of the datasets, negatively impacting the performance of our model.  
+
+We need to limit the size of our dataset while preserving a sufficient predictive value and before setting a frequency threshold, we take a look at the percentage that low frequencies represent in the ngrams, we limit this view to frequencies from 1 to 6:      
+
+```{r}
+kable(head(unigrams_freqs))
+kable(head(bigrams_freqs))
+kable(head(trigrams_freqs))
+```
+
+This shows several things:    
+- how sparse the term frequency matrices are   
+- the higher the ngram orders (unigram, bigram, ...), the more sparse the distributions are   
+- the exploration phase is performed on 10% of the data, we can imagine how much bigger the sparsity can become when working on the full dataset, and rolling out the process to fourgrams and fivegrams.   
+- by setting the threshold to frequency 4 for instance, we would reduce the file size and ngrams by `r round(sum(unigrams_freqs[1:4,3]), 4)*100`% for unigrams, `r round(sum(bigrams_freqs[1:4,3]), 4)*100`% for bigrams and `r round(sum(trigrams_freqs[1:4,3]), 4)*100`% for trigrams.    
+
+I will reiterate this exploration phase when working on the full dataset in order to decide which frequency threshold should be chosen. The choice is fairly arbitrary though and consists of a tradeoff between reducing the size of the dataset (i.e. improving the performance/speed of the language model) and the expected loss of predictive value by trimming too many low frequency ngrams.    
+
+
+##5. Deployment plan - next steps
+
+###5.1. Project files: 
+The final project will include the following files:  
+- 1_PredNext_Milsetone_Report: this document   
+- 2_PredNext_Prepare_FullDataSet: the steps and code used to create the full dataset   
+- 3_PredNext_Language_Models: code for testing the selected models   
+- shiny_app: folder with the ui.R and server.R files
+- The 5 data files: unigrams, bigrams, trigrams, fourgrams, fivegrams   
+- Pitch   
+
+###5.2. Data: 
+- Replicate the code to create ngrams on the whole dataset: slicing data in several chunks, process them separately and collate    
+- Extract also fourgrams and fivegrams   
+- Trim ngrams with low frequency   
+- We will work on English data only, but the code will allow to replicate the process in other languages   
+
+###5.3. Develop the algorithm:    
+- Code for converting input text as a character vector, taking the last 4 words of the input text (or less when there is less text)   
+- Match the input ngram to the datasets of input_ngram + 1   
+- Example: if input text is "I like to", we transform it into "i like to", a 3gram. Therefore we use the 4gram dataset, checking for all 4grams starting with "I like to ..." --> we can find several 4grams for this: "I like to think", "I like to call", "I like to be", ... and for each option, we have a frequency count.  
+- Explore different popular NLP options: Katz backoff, Stupid backoff, Kneser-Ney smoothing, Witten-Bell smoothing, ...   
+
+###5.4. Test for accuracy and performance
+- Find an accuracy measure   
+- Monitor the reaction time of each tested algorithm and decide for a reasonable accuracy/performance tradeoff   
+
+###5.5. Prepare the shiny app 
+On top of a reactive application, I will endeavour to provide additional features such as:    
+- keyboard shortkeys to select a suggested word   
+- suggest the currently typed word   
+- user-based login allowing to prioritize the history of ngrams from a specific user in order to improve individual user experience over time   
+- suggest current word    
+
+###5.6. Pitch presentation
+  
+
+##References
+**"Speech and Language Processing", Jurafsky & Martin, 28.08.2017, Chapter 4, https://web.stanford.edu/~jurafsky/slp3/ed3book.pdf: **the book as well as the course videos (https://www.youtube.com/watch?v=s3kKlUBa3b0)  are a must-read/view.   
+**"Text Mining with R", Julia Silge and David Robinson, 20.01.2018, https://www.tidytextmining.com/tfidf.html#zipfs-law: **    
+**Word Prediction Using Stupid Backoff With a 5-gram Language Model, Phil Ferriere, April 2016, https://rpubs.com/pferriere/dscapreport: **a great explanation of the stupid backoff model and Kneser Ney smoothing.   
+
