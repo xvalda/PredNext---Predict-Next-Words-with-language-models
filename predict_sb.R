@@ -10,7 +10,7 @@ predict_sb <- function(input_text){
   #prepare search strings
   a4 <- paste0("^", input_4gr, " ")
   a3 <- paste0("^", input_3gr, " ")
-  a2 <- paste0("^", input_2gr, " ")
+  a2 <- paste0("^", input_2gr, " ") 
   a1 <- paste0("^", input_1gr, " ")
   res <- data.table(ngrams = "", s = 0)
   if(length(a)>=4){
